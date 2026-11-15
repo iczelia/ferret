@@ -1,0 +1,40 @@
+[Unit]
+Description=ferret: download threat-intel feeds and rebuild intel.bin
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ferret
+Group=ferret
+Environment="FERRET_CONTACT=ferret-intel (a@example.com)"
+StateDirectory=ferret ferret/feeds
+StateDirectoryMode=0755
+UMask=0022
+ExecStart=/usr/local/bin/ferret-intel --state-dir /var/lib/ferret/feeds --out /var/lib/ferret/intel.bin --changed-marker /var/lib/ferret/.intel-changed
+ExecStartPost=+/bin/sh -c 'if [ -e /var/lib/ferret/.intel-changed ]; then rm -f /var/lib/ferret/.intel-changed; /usr/sbin/nginx -t -q && /usr/sbin/nginx -s reload; fi'
+TimeoutStartSec=20min
+Nice=10
+IOSchedulingClass=idle
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ferret
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

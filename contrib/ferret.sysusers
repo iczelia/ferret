@@ -1,0 +1,3 @@
+# Install as /usr/lib/sysusers.d/ferret.conf, then: systemd-sysusers
+# User for the feed downloaders.
+u ferret - "nginx ferret feed updater" /var/lib/ferret
