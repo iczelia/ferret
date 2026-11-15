@@ -1,0 +1,970 @@
+#!/usr/bin/python3
+
+import argparse
+import csv
+import fcntl
+import gzip
+import hashlib
+import html
+import io
+import json
+import lzma
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+TAGS = [
+    "tor_exit", "tor_relay", "cloud_aws", "cloud_gcp", "google", "cloud_azure",
+    "cloud_oracle", "cloud_do", "cloud_linode", "cdn_cloudflare", "cdn_fastly",
+    "github", "hosting_asn", "crawler_google", "google_special",
+    "google_user_fetch", "crawler_bing", "crawler_openai", "crawler_apple",
+    "crawler_perplexity", "crawler_ccbot", "crawler_ddg", "relay_icloud",
+    "isp_starlink", "vpn", "datacenter", "spamhaus_drop", "spamhaus_asndrop",
+    "firehol_l1", "firehol_l2", "firehol_l3", "abusech_feodo", "blocklist_de",
+    "cins", "et_compromised", "bgp_eyeball", "bgp_content", "bgp_carrier",
+    "bgp_t1",
+    # 39+
+    "scanner_research", "abuseipdb", "dshield", "bruteforce", "bogon", "open_proxy",
+    "vpn_commercial", "zscaler", "monitoring", "crawler_ahrefs", "crawler_amazon",
+    "yandex", "meta", "social_other", "cloud_vultr", "cloud_hetzner", "cloud_ovh",
+    "cloud_other",
+]
+TAG_BIT = {name: i for i, name in enumerate(TAGS)}
+assert len(TAGS) <= 64 and TAG_BIT["bgp_t1"] == 38 and TAG_BIT["scanner_research"] == 39
+
+HOUR = 3600
+DAY = 24 * HOUR
+WEEK = 7 * DAY
+
+GH = "https://raw.githubusercontent.com"
+GOOG_IPR = "https://developers.google.com/static/search/apis/ipranges"
+IPVERSE = GH + "/ipverse/asn-ip/master/as"          # per-ASN announced prefixes, daily
+LORD = GH + "/lord-alfred/ipranges/main"            # per-company prefixes, daily
+
+FEEDS = [
+    # name                      url                                                              parser         tag                  cadence
+    ("tor_exit",               "https://check.torproject.org/torbulkexitlist",                  "text",        "tor_exit",          HOUR),
+    ("tor_relay",              "https://onionoo.torproject.org/summary?running=true",           "json",        "tor_relay",         6 * HOUR),
+    ("aws",                    "https://ip-ranges.amazonaws.com/ip-ranges.json",                "json",        "cloud_aws",         DAY),
+    ("gcp",                    "https://www.gstatic.com/ipranges/cloud.json",                   "json",        "cloud_gcp",         DAY),
+    ("goog",                   "https://www.gstatic.com/ipranges/goog.json",                    "json",        "google",            DAY),
+    ("azure",                  "https://www.microsoft.com/en-us/download/details.aspx?id=56519", "azure",      "cloud_azure",       WEEK),
+    ("oracle",                 "https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.json", "json",       "cloud_oracle",      DAY),
+    ("digitalocean",           "https://www.digitalocean.com/geo/google.csv",                   "text",        "cloud_do",          DAY),
+    ("linode",                 "https://geoip.linode.com/",                                     "text",        "cloud_linode",      DAY),
+    ("cloudflare_v4",          "https://www.cloudflare.com/ips-v4",                             "text",        "cdn_cloudflare",    WEEK),
+    ("cloudflare_v6",          "https://www.cloudflare.com/ips-v6",                             "text",        "cdn_cloudflare",    WEEK),
+    ("fastly",                 "https://api.fastly.com/public-ip-list",                         "json",        "cdn_fastly",        WEEK),
+    ("github",                 "https://api.github.com/meta",                                   "json",        "github",            DAY),
+    ("bad_asn",                GH + "/brianhama/bad-asn-list/master/bad-asn-list.csv",          "badasn",      "hosting_asn",       WEEK),
+    ("bgptools_asns",          "https://bgp.tools/asns.csv",                                    "bgptools",    None,                DAY),
+    ("googlebot",              GOOG_IPR + "/googlebot.json",                                    "json",        "crawler_google",    DAY),
+    ("google_special",         GOOG_IPR + "/special-crawlers.json",                             "json",        "google_special",    DAY),
+    ("google_user_fetch",      GOOG_IPR + "/user-triggered-fetchers.json",                      "json",        "google_user_fetch", DAY),
+    ("google_user_fetch_goog", GOOG_IPR + "/user-triggered-fetchers-google.json",               "json",        "google_user_fetch", DAY),
+    ("bingbot",                "https://www.bing.com/toolbox/bingbot.json",                     "json",        "crawler_bing",      DAY),
+    ("openai_gptbot",          "https://openai.com/gptbot.json",                                "json",        "crawler_openai",    DAY),
+    ("openai_searchbot",       "https://openai.com/searchbot.json",                             "json",        "crawler_openai",    DAY),
+    ("openai_chatgpt_user",    "https://openai.com/chatgpt-user.json",                          "json",        "crawler_openai",    DAY),
+    ("applebot",               "https://search.developer.apple.com/applebot.json",              "json",        "crawler_apple",     DAY),
+    ("perplexitybot",          "https://www.perplexity.com/perplexitybot.json",                 "json",        "crawler_perplexity", DAY),
+    ("perplexity_user",        "https://www.perplexity.com/perplexity-user.json",               "json",        "crawler_perplexity", DAY),
+    ("ccbot",                  "https://index.commoncrawl.org/ccbot.json",                      "json",        "crawler_ccbot",     WEEK),
+    ("duckduckbot",            "https://duckduckgo.com/duckduckbot.json",                       "json",        "crawler_ddg",       WEEK),
+    ("icloud_relay",           "https://mask-api.icloud.com/egress-ip-ranges.csv",              "text",        "relay_icloud",      DAY),
+    ("starlink",               "https://geoip.starlinkisp.net/feed.csv",                        "text",        "isp_starlink",      WEEK),
+    ("x4b_vpn",                GH + "/X4BNet/lists_vpn/main/output/vpn/ipv4.txt",               "text",        "vpn",               DAY),
+    ("x4b_datacenter",         GH + "/X4BNet/lists_vpn/main/output/datacenter/ipv4.txt",        "text",        "datacenter",        DAY),
+    ("spamhaus_drop_v4",       "https://www.spamhaus.org/drop/drop_v4.json",                    "ndjson_cidr", "spamhaus_drop",     DAY),
+    ("spamhaus_drop_v6",       "https://www.spamhaus.org/drop/drop_v6.json",                    "ndjson_cidr", "spamhaus_drop",     DAY),
+    ("spamhaus_asndrop",       "https://www.spamhaus.org/drop/asndrop.json",                    "ndjson_asn",  "spamhaus_asndrop",  DAY),
+    ("firehol_l1",             GH + "/firehol/blocklist-ipsets/master/firehol_level1.netset",   "text",        "firehol_l1",        DAY),
+    ("firehol_l2",             GH + "/firehol/blocklist-ipsets/master/firehol_level2.netset",   "text",        "firehol_l2",        DAY),
+    ("firehol_l3",             GH + "/firehol/blocklist-ipsets/master/firehol_level3.netset",   "text",        "firehol_l3",        DAY),
+    ("ipsum",                  GH + "/stamparm/ipsum/master/ipsum.txt",                         "ipsum",       None,                DAY),
+    ("abusech_feodo",          "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",       "text",        "abusech_feodo",     HOUR),
+    ("blocklist_de",           "https://lists.blocklist.de/lists/all.txt",                      "text",        "blocklist_de",      HOUR),
+    ("cins",                   "https://cinsscore.com/list/ci-badguys.txt",                     "text",        "cins",              DAY),
+    ("et_compromised",         "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", "text",     "et_compromised",    DAY),
+    # tag bits 39+
+    # research scanners (Censys, Shodan, Shadowserver, Rapid7, Xpanse, Onyphe, LeakIX, ...)
+    ("maltrail_mass_scanner",  GH + "/stamparm/maltrail/master/data/mass_scanner.txt",      "text",        "scanner_research",  DAY),
+    ("maltrail_mass_scanner_cidr", GH + "/stamparm/maltrail/master/data/mass_scanner_cidr.txt", "text",    "scanner_research",  DAY),
+    ("isc_research",           "https://isc.sans.edu/api/threatcategory/research?json",       "json",        "scanner_research",  DAY),
+    # attackers / abuse
+    ("abuseipdb_borestad",     GH + "/borestad/blocklist-abuseipdb/main/abuseipdb-s100-30d.ipv4", "text",    "abuseipdb",         DAY),
+    ("dshield_block",          "https://feeds.dshield.org/block.txt",                         "range2",      "dshield",           6 * HOUR),
+    ("greensnow",              "https://blocklist.greensnow.co/greensnow.txt",                "text",        "bruteforce",        6 * HOUR),
+    ("binarydefense",          "https://www.binarydefense.com/banlist.txt",                   "text",        "bruteforce",        6 * HOUR),
+    ("bruteforceblocker",      "https://danger.rulez.sk/projects/bruteforceblocker/blist.php", "text",       "bruteforce",        6 * HOUR),
+    ("cymru_fullbogons_v4",    "https://www.team-cymru.org/Services/Bogons/fullbogons-ipv4.txt", "text",     "bogon",             DAY),
+    ("cymru_fullbogons_v6",    "https://www.team-cymru.org/Services/Bogons/fullbogons-ipv6.txt", "text",     "bogon",             DAY),
+    # open proxies
+    ("monosans_proxies",       GH + "/monosans/proxy-list/main/proxies/all.txt",              "hostport",    "open_proxy",        6 * HOUR),
+    ("speedx_http",            GH + "/TheSpeedX/PROXY-List/master/http.txt",                  "hostport",    "open_proxy",        6 * HOUR),
+    ("speedx_socks4",          GH + "/TheSpeedX/PROXY-List/master/socks4.txt",                "hostport",    "open_proxy",        6 * HOUR),
+    ("speedx_socks5",          GH + "/TheSpeedX/PROXY-List/master/socks5.txt",                "hostport",    "open_proxy",        6 * HOUR),
+    ("firehol_socks_proxy_7d", GH + "/firehol/blocklist-ipsets/master/socks_proxy_7d.ipset",  "text",        "open_proxy",        DAY),
+    ("firehol_sslproxies_7d",  GH + "/firehol/blocklist-ipsets/master/sslproxies_7d.ipset",   "text",        "open_proxy",        DAY),
+    # commercial VPN servers (server IP ~ exit IP)
+    ("mullvad",                "https://api.mullvad.net/www/relays/all/",                     "json",        "vpn_commercial",    DAY),
+    ("nordvpn",                "https://api.nordvpn.com/v1/servers?limit=20000&fields%5Bservers.station%5D=&fields%5Bservers.ipv6_station%5D=",
+                                                                                              "json",        "vpn_commercial",    DAY),
+    ("protonvpn",              LORD + "/protonvpn/ipv4_merged.txt",                           "text",        "vpn_commercial",    DAY),
+    ("pia",                    "https://serverlist.piaservers.net/vpninfo/servers/v6",        "json",        "vpn_commercial",    DAY),
+    ("ivpn",                   "https://api.ivpn.net/v5/servers.json",                        "jsonkeys:host", "vpn_commercial",  DAY),
+    # corporate security proxy (benign)
+    ("zscaler_cenr",           "https://config.zscaler.com/api/zscaler.net/cenr/json",        "json",        "zscaler",           WEEK),
+    ("zscaler_hubs",           "https://config.zscaler.com/api/zscaler.net/hubs/cidr/json/recommended", "json", "zscaler",        WEEK),
+    # uptime / synthetic monitoring (benign automation)
+    ("uptimerobot",            "https://uptimerobot.com/inc/files/ips/IPv4andIPv6.txt",       "text",        "monitoring",        DAY),
+    ("pingdom_v4",             "https://my.pingdom.com/probes/ipv4",                          "text",        "monitoring",        DAY),
+    ("pingdom_v6",             "https://my.pingdom.com/probes/ipv6",                          "text",        "monitoring",        DAY),
+    ("statuscake",             "https://app.statuscake.com/Workfloor/Locations.php?format=txt", "text",      "monitoring",        DAY),
+    ("betterstack",            "https://uptime.betterstack.com/ips.txt",                      "text",        "monitoring",        DAY),
+    ("updown_v4",              "https://updown.io/api/nodes/ipv4",                            "json",        "monitoring",        DAY),
+    ("updown_v6",              "https://updown.io/api/nodes/ipv6",                            "json",        "monitoring",        DAY),
+    ("checkly",                "https://api.checklyhq.com/v1/static-ips",                     "json",        "monitoring",        DAY),
+    ("datadog_synthetics",     "https://ip-ranges.datadoghq.com/synthetics.json",             "json",        "monitoring",        DAY),
+    # more crawlers
+    ("ahrefsbot",              "https://api.ahrefs.com/v3/public/crawler-ip-ranges",          "json",        "crawler_ahrefs",    DAY),
+    ("amazonbot",              "https://developer.amazon.com/amazonbot/ip-addresses/",        "html_json",   "crawler_amazon",    DAY),
+    ("duckassistbot",          "https://duckduckgo.com/duckassistbot.json",                   "json",        "crawler_ddg",       WEEK),
+    # company networks (announced prefixes)
+    ("yandex_v4",              IPVERSE + "/13238/ipv4-aggregated.txt",                        "text",        "yandex",            WEEK),
+    ("yandex_v6",              IPVERSE + "/13238/ipv6-aggregated.txt",                        "text",        "yandex",            WEEK),
+    ("meta_v4",                LORD + "/facebook/ipv4_merged.txt",                            "text",        "meta",              WEEK),
+    ("meta_v6",                LORD + "/facebook/ipv6_merged.txt",                            "text",        "meta",              WEEK),
+    ("telegram",               "https://core.telegram.org/resources/cidr.txt",                "text",        "social_other",      WEEK),
+    ("twitter_v4",             LORD + "/twitter/ipv4_merged.txt",                             "text",        "social_other",      WEEK),
+    ("twitter_v6",             LORD + "/twitter/ipv6_merged.txt",                             "text",        "social_other",      WEEK),
+    # more hosting
+    ("vultr",                  "https://geofeed.constant.com/?text",                          "text",        "cloud_vultr",       WEEK),
+    ("hetzner",                "https://www.hetzner.com/geofeed.csv",                         "text",        "cloud_hetzner",     WEEK),
+    ("ovh_v4",                 IPVERSE + "/16276/ipv4-aggregated.txt",                        "text",        "cloud_ovh",         WEEK),
+    ("ovh_v6",                 IPVERSE + "/16276/ipv6-aggregated.txt",                        "text",        "cloud_ovh",         WEEK),
+    ("scaleway_v4",            IPVERSE + "/12876/ipv4-aggregated.txt",                        "text",        "cloud_other",       WEEK),
+    ("scaleway_v6",            IPVERSE + "/12876/ipv6-aggregated.txt",                        "text",        "cloud_other",       WEEK),
+    ("alibaba_v4",             IPVERSE + "/45102/ipv4-aggregated.txt",                        "text",        "cloud_other",       WEEK),
+    ("alibaba_v6",             IPVERSE + "/45102/ipv6-aggregated.txt",                        "text",        "cloud_other",       WEEK),
+    ("tencent_v4",             IPVERSE + "/132203/ipv4-aggregated.txt",                       "text",        "cloud_other",       WEEK),
+    ("tencent_v6",             IPVERSE + "/132203/ipv6-aggregated.txt",                       "text",        "cloud_other",       WEEK),
+    ("ibm_softlayer_v4",       IPVERSE + "/36351/ipv4-aggregated.txt",                        "text",        "cloud_other",       WEEK),
+    ("ibm_softlayer_v6",       IPVERSE + "/36351/ipv6-aggregated.txt",                        "text",        "cloud_other",       WEEK),
+    ("contabo_v4",             IPVERSE + "/51167/ipv4-aggregated.txt",                        "text",        "cloud_other",       WEEK),
+    ("contabo_v6",             IPVERSE + "/51167/ipv6-aggregated.txt",                        "text",        "cloud_other",       WEEK),
+]
+FEED_BY_NAME = {f[0]: f for f in FEEDS}
+
+# bgp.tools class -> ASN tags ("Unknown" gets no bit)
+BGP_CLASS_TAGS = {
+    "eyeball": ["bgp_eyeball"],
+    "content": ["bgp_content", "hosting_asn"],
+    "carrier": ["bgp_carrier"],
+    "t1": ["bgp_t1"],
+}
+
+AZURE_JSON_RE = re.compile(
+    rb'https://download\.microsoft\.com/download/[^"\'<>\s]*?ServiceTags_Public_\d+\.json')
+
+DEFAULT_STATE_DIR = "/var/lib/ferret/feeds"
+DEFAULT_OUT = "/var/lib/ferret/intel.bin"
+DEFAULT_CONTACT = "ferret-intel (a@example.com)"
+HTTP_TIMEOUT = 90
+MAX_BODY = 512 * 1024 * 1024
+RETRY_SLACK = 600          # a run up to 10 min early still counts as "due" (timer jitter)
+
+MAGIC = b"FERI"
+FORMAT_VERSION = 1
+HEADER = struct.Struct("<4sIQIIIIIIIIIIII")       # 64 bytes
+V4_ENTRY = struct.Struct("<IIQB7x")              # 24 bytes
+V6_ENTRY = struct.Struct("<16s16sQB7x")          # 48 bytes
+ASN_ENTRY = struct.Struct("<IIQ")                # 16 bytes
+assert HEADER.size == 64 and V4_ENTRY.size == 24 and V6_ENTRY.size == 48 and ASN_ENTRY.size == 16
+
+V4_MAX = (1 << 32) - 1
+V6_MAX = (1 << 128) - 1
+
+
+def log(msg):
+    print(f"ferret-intel: {msg}", file=sys.stderr, flush=True)
+
+
+# Address parsing
+
+_inet_pton = socket.inet_pton
+_AF4 = socket.AF_INET
+_AF6 = socket.AF_INET6
+_from_bytes = int.from_bytes
+
+
+def parse_ip_range(s):
+    """Parse an IP, CIDR or 'a-b' range. Returns (family, start, end) or None."""
+    s = s.strip()
+    if not s or len(s) > 100:
+        return None
+    if "-" in s and "/" not in s:
+        a, _, b = s.partition("-")
+        ra, rb = parse_ip_range(a), parse_ip_range(b)
+        if ra and rb and ra[0] == rb[0] and ra[1] <= rb[2]:
+            return (ra[0], ra[1], rb[2])
+        return None
+    addr, slash, plen = s.partition("/")
+    if addr.startswith("["):
+        # "[v6]" or "[v6]:port"
+        close = addr.find("]")
+        if close < 0:
+            return None
+        addr = addr[1:close]
+    if ":" in addr:
+        fam, bits, af = 6, 128, _AF6
+        if "%" in addr:
+            return None
+    elif "." in addr:
+        fam, bits, af = 4, 32, _AF4
+    else:
+        return None
+    try:
+        v = _from_bytes(_inet_pton(af, addr), "big")
+    except OSError:
+        return None
+    if slash:
+        if not plen.isdigit():
+            return None
+        p = int(plen)
+        if p > bits:
+            return None
+    else:
+        p = bits
+    host = (1 << (bits - p)) - 1
+    start = v & ~host & ((1 << bits) - 1)
+    return (fam, start, start | host)
+
+
+def _maybe_ip(s):
+    return ("." in s or ":" in s) and len(s) <= 100 and s[:1] in "0123456789abcdefABCDEF[:"
+
+
+def _decode(data):
+    if data[:3] == b"\xef\xbb\xbf":
+        data = data[3:]
+    return data.decode("utf-8", errors="replace")
+
+
+def _json_load(text):
+    """json.loads that tolerates trailing data (e.g. PIA's appended signature)."""
+    return json.JSONDecoder().raw_decode(text.lstrip())[0]
+
+
+def _walk_ips(obj, tagmask, keys=None):
+    """All IP/CIDR strings anywhere in obj; with keys, only values (or lists of
+    values) stored under one of those dict keys."""
+    out = []
+    stack = [(obj, keys is None)]
+    while stack:
+        o, take = stack.pop()
+        if isinstance(o, dict):
+            for k, v in o.items():
+                stack.append((v, keys is None or k in keys))
+        elif isinstance(o, list):
+            stack.extend((v, take) for v in o)
+        elif take and isinstance(o, str) and _maybe_ip(o):
+            r = parse_ip_range(o)
+            if r:
+                out.append((r[0], r[1], r[2], tagmask, 0))
+    return out
+
+
+def parse_json_walk(data, tagmask):
+    return {"ranges": _walk_ips(_json_load(_decode(data)), tagmask), "asns": {}}
+
+
+def parse_json_keys(data, tagmask, arg):
+    keys = set(arg.split(","))
+    return {"ranges": _walk_ips(_json_load(_decode(data)), tagmask, keys), "asns": {}}
+
+
+_CODE_RE = re.compile(r"<(?:code|pre)\b[^>]*>(.*?)</(?:code|pre)>", re.S | re.I)
+_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def parse_html_json(data, tagmask):
+    """JSON documents shown in <pre>/<code> blocks of an HTML page (Amazonbot).
+    Only those blocks are read: the rest of such pages may echo the client IP."""
+    out = []
+    for block in _CODE_RE.findall(_decode(data)):
+        text = html.unescape(_TAG_RE.sub("", block)).strip()
+        if not text.startswith(("{", "[")):
+            continue
+        try:
+            obj = _json_load(text)
+        except ValueError:
+            continue
+        out.extend(_walk_ips(obj, tagmask))
+    return {"ranges": out, "asns": {}}
+
+
+def _lines(data):
+    for line in _decode(data).splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        for sep in ("#", ";"):
+            i = line.find(sep)
+            if i >= 0:
+                line = line[:i]
+        tok = line.replace(",", " ").replace("\t", " ").split()
+        if tok:
+            yield tok
+
+
+def parse_text(data, tagmask):
+    out = []
+    for tok in _lines(data):
+        r = parse_ip_range(tok[0])
+        if r:
+            out.append((r[0], r[1], r[2], tagmask, 0))
+    return {"ranges": out, "asns": {}}
+
+
+def parse_range2(data, tagmask):
+    """'start end ...' columns (DShield block.txt); a single address is a host."""
+    out = []
+    for tok in _lines(data):
+        a = parse_ip_range(tok[0])
+        if not a:
+            continue
+        b = parse_ip_range(tok[1]) if len(tok) > 1 else None
+        if b and b[0] == a[0] and b[2] >= a[1]:
+            a = (a[0], a[1], b[2])
+        out.append((a[0], a[1], a[2], tagmask, 0))
+    return {"ranges": out, "asns": {}}
+
+
+def parse_hostport(data, tagmask):
+    """Proxy lists: '[scheme://][user:pass@]host:port' -- host must be a literal IP."""
+    out = []
+    for tok in _lines(data):
+        s = tok[0]
+        i = s.find("://")
+        if i >= 0:
+            s = s[i + 3:]
+        s = s.rsplit("@", 1)[-1].split("/", 1)[0]
+        if not s.startswith("[") and s.count(":") == 1:
+            s = s.partition(":")[0]          # v4:port (bare v6 has >= 2 colons)
+        r = parse_ip_range(s)
+        if r:
+            out.append((r[0], r[1], r[2], tagmask, 0))
+    return {"ranges": out, "asns": {}}
+
+
+def _ndjson(data):
+    for line in _decode(data).splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
+def parse_ndjson_cidr(data, tagmask):
+    out = []
+    for o in _ndjson(data):
+        c = o.get("cidr")
+        if isinstance(c, str):
+            r = parse_ip_range(c)
+            if r:
+                out.append((r[0], r[1], r[2], tagmask, 0))
+    return {"ranges": out, "asns": {}}
+
+
+def _parse_asn(v):
+    if isinstance(v, int):
+        a = v
+    else:
+        v = str(v).strip().upper()
+        if v.startswith("AS"):
+            v = v[2:]
+        if not v.isdigit():
+            return None
+        a = int(v)
+    return a if 0 < a <= 0xFFFFFFFF else None
+
+
+def parse_ndjson_asn(data, tagmask):
+    asns = {}
+    for o in _ndjson(data):
+        a = _parse_asn(o.get("asn", ""))
+        if a:
+            asns[a] = asns.get(a, 0) | tagmask
+    return {"ranges": [], "asns": asns}
+
+
+def parse_ipsum(data, tagmask):
+    out = []
+    for line in _decode(data).splitlines():
+        if not line or line[0] == "#":
+            continue
+        parts = line.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            continue
+        r = parse_ip_range(parts[0])
+        if r:
+            out.append((r[0], r[1], r[2], 0, min(int(parts[1]), 255)))
+    return {"ranges": out, "asns": {}}
+
+
+def parse_badasn(data, tagmask):
+    asns = {}
+    for row in csv.reader(io.StringIO(_decode(data))):
+        if not row:
+            continue
+        a = _parse_asn(row[0])
+        if a:
+            asns[a] = asns.get(a, 0) | tagmask
+    return {"ranges": [], "asns": asns}
+
+
+def parse_bgptools(data, tagmask):
+    cls_mask = {k: sum(1 << TAG_BIT[t] for t in v) for k, v in BGP_CLASS_TAGS.items()}
+    asns = {}
+    n = 0
+    for row in csv.reader(io.StringIO(_decode(data))):
+        if len(row) < 3:
+            continue
+        a = _parse_asn(row[0])
+        if not a:
+            continue
+        n += 1
+        m = cls_mask.get(row[2].strip().lower(), 0)
+        if m:
+            asns[a] = asns.get(a, 0) | m
+    return {"ranges": [], "asns": asns, "count": n}
+
+
+PARSERS = {
+    "json": parse_json_walk,
+    "azure": parse_json_walk,
+    "text": parse_text,
+    "range2": parse_range2,
+    "hostport": parse_hostport,
+    "html_json": parse_html_json,
+    "jsonkeys": parse_json_keys,
+    "ndjson_cidr": parse_ndjson_cidr,
+    "ndjson_asn": parse_ndjson_asn,
+    "ipsum": parse_ipsum,
+    "badasn": parse_badasn,
+    "bgptools": parse_bgptools,
+}
+
+
+def parse_feed(name, data):
+    _, _, parser, tag, _ = FEED_BY_NAME[name]
+    tagmask = (1 << TAG_BIT[tag]) if tag else 0
+    pname, _, arg = parser.partition(":")
+    res = PARSERS[pname](data, tagmask, arg) if arg else PARSERS[pname](data, tagmask)
+    res["entries"] = res.pop("count", len(res["ranges"]) + len(res["asns"]))
+    return res
+
+
+# State / fetching
+
+class Feed:
+    def __init__(self, state_dir, name):
+        self.name = name
+        self.raw_path = os.path.join(state_dir, name + ".raw")
+        self.meta_path = os.path.join(state_dir, name + ".meta.json")
+        try:
+            with open(self.meta_path) as f:
+                self.meta = json.load(f)
+        except (OSError, ValueError):
+            self.meta = {}
+        if not self.meta.get("last_success") and os.path.exists(self.raw_path):
+            self.meta["last_success"] = int(os.path.getmtime(self.raw_path))
+
+    def save_meta(self):
+        atomic_write(self.meta_path, json.dumps(self.meta, indent=1, sort_keys=True).encode())
+
+    def due(self, now, cadence):
+        last_ok = self.meta.get("last_success", 0)
+        last_try = self.meta.get("last_attempt", 0)
+        if now - last_ok + RETRY_SLACK < cadence:
+            return False
+        # after a failure, retry at most hourly (or at the feed cadence if shorter)
+        if self.meta.get("last_error") and now - last_try + RETRY_SLACK < min(cadence, HOUR):
+            return False
+        return True
+
+
+def atomic_write(path, data, mode=0o644):
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def http_get(url, ua, etag=None, last_modified=None):
+    """Returns (status, body, headers). status 304 => body None."""
+    hdr = {"User-Agent": ua, "Accept-Encoding": "gzip", "Accept": "*/*"}
+    if etag:
+        hdr["If-None-Match"] = etag
+    if last_modified:
+        hdr["If-Modified-Since"] = last_modified
+    req = urllib.request.Request(url, headers=hdr)
+    try:
+        resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)   # follows redirects
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return 304, None, e.headers
+        raise
+    with resp:
+        body = resp.read(MAX_BODY + 1)
+        if len(body) > MAX_BODY:
+            raise ValueError("response too large")
+        if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+            body = gzip.decompress(body)
+        return resp.status, body, resp.headers
+
+
+def fetch_feed(feed, url, parser, ua, now):
+    """Download one feed; on success replace the cache. Raises on failure."""
+    m = feed.meta
+    etag, lm = m.get("etag"), m.get("last_modified")
+    if not os.path.exists(feed.raw_path):
+        etag = lm = None
+    if parser == "azure":
+        _, page, _ = http_get(url, ua)
+        found = AZURE_JSON_RE.search(page or b"")
+        if not found:
+            raise ValueError("ServiceTags_Public_*.json link not found on details page")
+        real = found.group(0).decode()
+        if real == m.get("resolved_url") and os.path.exists(feed.raw_path):
+            return "not modified"
+        url, etag, lm = real, None, None
+    status, body, headers = http_get(url, ua, etag, lm)
+    if status == 304:
+        return "not modified"
+    res = parse_feed(feed.name, body)            # validate before replacing the cache
+    if res["entries"] == 0:
+        raise ValueError(f"parsed 0 entries from {len(body)} bytes")
+    atomic_write(feed.raw_path, body)
+    m["etag"] = headers.get("ETag")
+    m["last_modified"] = headers.get("Last-Modified")
+    if parser == "azure":
+        m["resolved_url"] = url
+    m["bytes"] = len(body)
+    m["entries"] = res["entries"]
+    return f"{res['entries']} entries"
+
+
+# Sweep-line merge
+
+def merge_ranges(ranges):
+    """ranges: iterable of (start, end, tags, score), end inclusive.
+    Returns sorted non-overlapping [(start, end, tags, score)], with OR of tags and max
+    score of all covering ranges; adjacent equal intervals merged; empty dropped."""
+    # 1. combine identical (start, end) to shrink the event list
+    comb = {}
+    for s, e, t, sc in ranges:
+        k = (s, e)
+        old = comb.get(k)
+        if old is None:
+            comb[k] = (t, sc)
+        else:
+            comb[k] = (old[0] | t, sc if sc > old[1] else old[1])
+    if not comb:
+        return []
+    # 2. events: (pos, delta, tags, score); removal at end+1
+    events = []
+    ap = events.append
+    for (s, e), (t, sc) in comb.items():
+        if t == 0 and sc == 0:
+            continue
+        ap((s, 1, t, sc))
+        ap((e + 1, -1, t, sc))
+    events.sort(key=lambda ev: ev[0])
+    bitcount = [0] * 64
+    scorecount = [0] * 256
+    cur_tags = 0
+    cur_score = 0
+    out = []
+    i, n = 0, len(events)
+    while i < n:
+        pos = events[i][0]
+        while i < n and events[i][0] == pos:
+            _, d, t, sc = events[i]
+            i += 1
+            while t:
+                low = t & -t
+                b = low.bit_length() - 1
+                c = bitcount[b] + d
+                bitcount[b] = c
+                if d > 0:
+                    cur_tags |= low
+                elif c == 0:
+                    cur_tags &= ~low
+                t ^= low
+            if sc:
+                scorecount[sc] += d
+                if d > 0:
+                    if sc > cur_score:
+                        cur_score = sc
+                elif sc == cur_score and scorecount[sc] == 0:
+                    while cur_score and scorecount[cur_score] == 0:
+                        cur_score -= 1
+        if i >= n:
+            break
+        nxt = events[i][0]
+        if cur_tags or cur_score:
+            if out and out[-1][1] + 1 == pos and out[-1][2] == cur_tags and out[-1][3] == cur_score:
+                out[-1][1] = nxt - 1
+            else:
+                out.append([pos, nxt - 1, cur_tags, cur_score])
+    return [tuple(x) for x in out]
+
+
+# intel.bin encode / decode
+
+def _align8(n):
+    return (n + 7) & ~7
+
+
+def names_text():
+    return "".join(f"{i} {n}\n" for i, n in enumerate(TAGS)).encode()
+
+
+def encode_intel(v4, v6, asns, feeds_status, build_time):
+    t4 = b"".join(V4_ENTRY.pack(s, e, t, sc) for s, e, t, sc in v4)
+    t6 = b"".join(V6_ENTRY.pack(s.to_bytes(16, "big"), e.to_bytes(16, "big"), t, sc)
+                  for s, e, t, sc in v6)
+    ta = b"".join(ASN_ENTRY.pack(a, 0, asns[a]) for a in sorted(asns))
+    names = names_text()
+    feeds = json.dumps(feeds_status, sort_keys=True, separators=(",", ":")).encode()
+    parts = []
+    off = HEADER.size
+    offs = []
+    for blob in (t4, t6, ta, names, feeds):
+        off = _align8(off)
+        offs.append(off)
+        parts.append((off, blob))
+        off += len(blob)
+    hdr = HEADER.pack(MAGIC, FORMAT_VERSION, build_time, build_time & 0xFFFFFFFF,
+                      len(v4), len(v6), len(asns), offs[0], offs[1], offs[2],
+                      offs[3], len(names), offs[4], len(feeds), 0)
+    buf = bytearray(off)
+    buf[0:64] = hdr
+    for o, blob in parts:
+        buf[o:o + len(blob)] = blob
+    return bytes(buf)
+
+
+def decode_intel(buf):
+    h = HEADER.unpack_from(buf, 0)
+    (magic, ver, btime, iver, n4, n6, nasn, off4, off6, offasn,
+     offn, lenn, offf, lenf, _res) = h
+    if magic != MAGIC:
+        raise ValueError("bad magic")
+    if ver != FORMAT_VERSION:
+        raise ValueError(f"unsupported format_version {ver}")
+    v4 = [V4_ENTRY.unpack_from(buf, off4 + i * 24) for i in range(n4)]
+    v6 = []
+    for i in range(n6):
+        s, e, t, sc = V6_ENTRY.unpack_from(buf, off6 + i * 48)
+        v6.append((int.from_bytes(s, "big"), int.from_bytes(e, "big"), t, sc))
+    asns = [ASN_ENTRY.unpack_from(buf, offasn + i * 16) for i in range(nasn)]
+    return {
+        "build_time": btime, "intel_version": iver,
+        "v4": v4, "v6": v6, "asns": [(a, t) for a, _, t in asns],
+        "names": buf[offn:offn + lenn].decode(),
+        "feeds": json.loads(buf[offf:offf + lenf].decode() or "{}"),
+        "_tables": bytes(buf[off4:off4 + n4 * 24]) + bytes(buf[off6:off6 + n6 * 48])
+                   + bytes(buf[offasn:offasn + nasn * 16]),
+    }
+
+
+def content_digest(tables_bytes, names, feeds):
+    """Digest of everything except timestamps -- decides whether a rebuild is a change."""
+    h = hashlib.sha256(tables_bytes)
+    h.update(names.encode() if isinstance(names, str) else names)
+    norm = {k: {kk: vv for kk, vv in v.items() if kk != "fetched"} for k, v in feeds.items()}
+    h.update(json.dumps(norm, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def tag_names(mask):
+    out = []
+    for i in range(64):
+        if mask >> i & 1:
+            out.append(TAGS[i] if i < len(TAGS) else f"bit{i}")
+    return ",".join(out) or "-"
+
+
+def fmt_addr(fam, v):
+    if fam == 4:
+        return socket.inet_ntop(_AF4, v.to_bytes(4, "big"))
+    return socket.inet_ntop(_AF6, v.to_bytes(16, "big"))
+
+
+def lookup(d, ip):
+    import bisect
+    r = parse_ip_range(ip)
+    if not r or r[1] != r[2]:
+        raise ValueError(f"not an IP address: {ip}")
+    tab = d["v4"] if r[0] == 4 else d["v6"]
+    starts = [x[0] for x in tab]
+    i = bisect.bisect_right(starts, r[1]) - 1
+    if i >= 0 and tab[i][0] <= r[1] <= tab[i][1]:
+        return tab[i]
+    return None
+
+
+# Build
+
+def build(state_dir, now):
+    r4, r6, asns, status = [], [], {}, {}
+    for name, _url, _parser, _tag, cadence in FEEDS:
+        feed = Feed(state_dir, name)
+        m = feed.meta
+        st = {"ok": False, "fetched": int(m.get("last_success", 0)), "entries": 0,
+              "error": m.get("last_error")}
+        if not os.path.exists(feed.raw_path):
+            st["fetched"] = 0
+            st["error"] = st["error"] or "no cached data"
+            status[name] = st
+            continue
+        try:
+            with open(feed.raw_path, "rb") as f:
+                res = parse_feed(name, f.read())
+        except Exception as e:   # noqa: BLE001 -- isolate any parser failure
+            st["error"] = f"parse: {type(e).__name__}: {e}"
+            status[name] = st
+            continue
+        st["entries"] = res["entries"]
+        st["ok"] = not st["error"]
+        limit = max(4 * cadence, 2 * DAY)
+        if st["fetched"] and now - st["fetched"] > limit:
+            # message must not contain the age, else every run would count as a change
+            st["ok"] = False
+            st["error"] = (st["error"] + "; " if st["error"] else "") + \
+                f"stale: no success for more than {limit // HOUR} h"
+        for fam, s, e, t, sc in res["ranges"]:
+            (r4 if fam == 4 else r6).append((s, e, t, sc))
+        for a, t in res["asns"].items():
+            asns[a] = asns.get(a, 0) | t
+        status[name] = st
+    t0 = time.monotonic()
+    v4 = merge_ranges(r4)
+    v6 = merge_ranges(r6)
+    log(f"merged {len(r4)}+{len(r6)} ranges -> {len(v4)} v4 + {len(v6)} v6 intervals, "
+        f"{len(asns)} ASNs in {time.monotonic() - t0:.1f}s")
+    return v4, v6, asns, status
+
+
+def archive(state_dir, data, iver):
+    adir = os.path.join(state_dir, "archive")
+    os.makedirs(adir, exist_ok=True)
+    atomic_write(os.path.join(adir, f"intel-{iver}.bin.xz"), lzma.compress(data, preset=6))
+
+
+# CLI
+
+def cmd_dump(path):
+    with open(path, "rb") as f:
+        d = decode_intel(f.read())
+    w = sys.stdout.write
+    w(f"# build_time {d['build_time']} ({time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(d['build_time']))} UTC)"
+      f" intel_version {d['intel_version']}\n")
+    w(f"# v4 {len(d['v4'])}  v6 {len(d['v6'])}  asn {len(d['asns'])}\n")
+    w("# feeds\n")
+    for k, v in sorted(d["feeds"].items()):
+        w(f"feed {k} ok={v['ok']} fetched={v['fetched']} entries={v['entries']} error={v['error']}\n")
+    w("# names\n" + d["names"])
+    for s, e, t, sc in d["v4"]:
+        w(f"v4 {fmt_addr(4, s)} {fmt_addr(4, e)} {tag_names(t)} {sc}\n")
+    for s, e, t, sc in d["v6"]:
+        w(f"v6 {fmt_addr(6, s)} {fmt_addr(6, e)} {tag_names(t)} {sc}\n")
+    for a, t in d["asns"]:
+        w(f"asn {a} {tag_names(t)}\n")
+
+
+def cmd_lookup(args):
+    what = args[0]
+    path = args[1] if len(args) > 1 else DEFAULT_OUT
+    with open(path, "rb") as f:
+        d = decode_intel(f.read())
+    a = _parse_asn(what) if what.upper().startswith("AS") or what.isdigit() else None
+    if a:
+        for asn, t in d["asns"]:
+            if asn == a:
+                print(f"AS{a} tags={tag_names(t)}")
+                return 0
+        print(f"AS{a} tags=-")
+        return 0
+    hit = lookup(d, what)
+    if hit:
+        fam = 4 if ":" not in what else 6
+        print(f"{what} range={fmt_addr(fam, hit[0])}-{fmt_addr(fam, hit[1])} "
+              f"tags={tag_names(hit[2])} score={hit[3]}")
+    else:
+        print(f"{what} tags=- score=0")
+    return 0
+
+
+def cmd_list_tags():
+    by_tag = {}
+    for name, _u, parser, tag, _c in FEEDS:
+        if tag:
+            by_tag.setdefault(tag, []).append(name)
+    for cls, tags in BGP_CLASS_TAGS.items():
+        for t in tags:
+            by_tag.setdefault(t, []).append(f"bgptools_asns[{cls}]")
+    asn_level = {"hosting_asn", "spamhaus_asndrop", "bgp_eyeball", "bgp_content",
+                 "bgp_carrier", "bgp_t1"}
+    for i, n in enumerate(TAGS):
+        lvl = "asn  " if n in asn_level else "range"
+        print(f"{i:2d} {n:20s} {lvl} {', '.join(by_tag.get(n, []))}")
+    print("   ipsum_score          range ipsum (u8 score, not a bit)")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="ferret-intel",
+        description="Download threat-intel/classification feeds and build intel.bin "
+                    "for the nginx ferret module.")
+    ap.add_argument("--state-dir", default=DEFAULT_STATE_DIR,
+                    help=f"feed cache directory (default {DEFAULT_STATE_DIR})")
+    ap.add_argument("--out", default=DEFAULT_OUT, help=f"output file (default {DEFAULT_OUT})")
+    ap.add_argument("--contact", default=os.environ.get("FERRET_CONTACT", DEFAULT_CONTACT),
+                    help="HTTP User-Agent incl. contact address, required by bgp.tools "
+                         f"(env FERRET_CONTACT; default {DEFAULT_CONTACT!r})")
+    ap.add_argument("--offline", action="store_true", help="no network; build from cache only")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore cadences (fetch all due-or-not) and always rewrite the output")
+    ap.add_argument("--only", metavar="FEED,...",
+                    help="fetch only these feeds (ignoring their cadence); "
+                         "the build still uses every cached feed")
+    ap.add_argument("--reload", action="store_true",
+                    help="run 'nginx -s reload' after a build whose content changed")
+    ap.add_argument("--changed-marker", metavar="PATH",
+                    help="touch PATH when the build content changed (for a privileged "
+                         "ExecStartPost that reloads nginx)")
+    ap.add_argument("--list-tags", action="store_true", help="print tag bits and their sources")
+    ap.add_argument("--list-feeds", action="store_true", help="print the feed table")
+    ap.add_argument("--dump", metavar="FILE", help="decode an intel.bin to text")
+    ap.add_argument("--lookup", nargs="+", metavar=("IP|ASN", "FILE"),
+                    help="look up an IP (or ASxxx) in FILE (default --out)")
+    a = ap.parse_args(argv)
+
+    if a.list_tags:
+        cmd_list_tags()
+        return 0
+    if a.list_feeds:
+        for name, url, parser, tag, cad in FEEDS:
+            print(f"{name:26s} {cad // HOUR:4d}h {parser:13s} {tag or '-':20s} {url}")
+        return 0
+    if a.dump:
+        cmd_dump(a.dump)
+        return 0
+    if a.lookup:
+        return cmd_lookup(a.lookup)
+
+    only = None
+    if a.only:
+        only = {x.strip() for x in a.only.split(",") if x.strip()}
+        bad = only - set(FEED_BY_NAME)
+        if bad:
+            ap.error(f"unknown feed(s): {', '.join(sorted(bad))} (see --list-feeds)")
+
+    os.makedirs(a.state_dir, exist_ok=True)
+    lockf = open(os.path.join(a.state_dir, ".lock"), "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another instance is running; exiting")
+        return 1
+
+    now = int(time.time())
+    if not a.offline:
+        for name, url, parser, _tag, cadence in FEEDS:
+            if only is not None and name not in only:
+                continue
+            feed = Feed(a.state_dir, name)
+            if only is None and not a.force and not feed.due(now, cadence):
+                continue
+            feed.meta["last_attempt"] = now
+            try:
+                msg = fetch_feed(feed, url, parser, a.contact, now)
+                feed.meta["last_success"] = int(time.time())
+                feed.meta["last_error"] = None
+                log(f"{name}: {msg}")
+            except Exception as e:   # noqa: BLE001 -- per-feed isolation
+                err = f"{type(e).__name__}: {e}"[:300]
+                feed.meta["last_error"] = err
+                log(f"{name}: FAILED ({err}); keeping previous data")
+            feed.save_meta()
+
+    v4, v6, asns, status = build(a.state_dir, now)
+    data = encode_intel(v4, v6, asns, status, now)
+    new = decode_intel(data)
+    new_digest = content_digest(new["_tables"], new["names"], new["feeds"])
+    old_digest = None
+    try:
+        with open(a.out, "rb") as f:
+            old = decode_intel(f.read())
+        old_digest = content_digest(old["_tables"], old["names"], old["feeds"])
+    except (OSError, ValueError, struct.error):
+        pass
+    nfail = sum(1 for s in status.values() if not s["ok"])
+    if old_digest == new_digest and not a.force:
+        log(f"content unchanged; keeping {a.out} ({nfail} feed(s) not ok)")
+        return 0
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    atomic_write(a.out, data)
+    try:
+        archive(a.state_dir, data, now & 0xFFFFFFFF)
+    except OSError as e:
+        log(f"archive failed: {e}")
+    log(f"wrote {a.out}: intel_version {now & 0xFFFFFFFF}, {len(v4)} v4, {len(v6)} v6, "
+        f"{len(asns)} ASN entries, {len(data)} bytes; {nfail} feed(s) not ok")
+    if old_digest != new_digest:
+        if a.changed_marker:
+            with open(a.changed_marker, "w") as f:
+                f.write(f"{now}\n")
+        if a.reload:
+            r = subprocess.run(["nginx", "-s", "reload"])
+            if r.returncode != 0:
+                log(f"nginx -s reload failed with exit code {r.returncode}")
+                return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

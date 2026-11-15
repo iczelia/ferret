@@ -1,0 +1,155 @@
+#!/usr/bin/python3
+"""Download the DB-IP Lite City and ASN mmdb databases.
+
+IP Geolocation by DB-IP (https://db-ip.com), licensed under CC BY 4.0.
+"""
+
+import argparse
+import datetime
+import gzip
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+ATTRIBUTION = "IP Geolocation by DB-IP (https://db-ip.com), licensed under CC BY 4.0"
+URL_TEMPLATE = "https://download.db-ip.com/free/dbip-{kind}-lite-{ym}.mmdb.gz"
+KINDS = ("city", "asn")
+DEFAULT_DIR = "/var/lib/ferret"
+DEFAULT_UA = "ferret-geo (a@example.com)"
+MMDB_MARKER = b"\xab\xcd\xefMaxMind.com"
+MARKER_WINDOW = 128 * 1024
+MIN_SIZE = 1024 * 1024
+HTTP_TIMEOUT = 120
+
+
+def log(msg):
+    print(f"ferret-geo: {msg}", file=sys.stderr, flush=True)
+
+
+def months(today):
+    cur = today.strftime("%Y-%m")
+    first = today.replace(day=1)
+    prev = (first - datetime.timedelta(days=1)).strftime("%Y-%m")
+    return [cur, prev]
+
+
+def check_mmdb(path):
+    size = os.path.getsize(path)
+    if size < MIN_SIZE:
+        raise ValueError(f"too small ({size} bytes)")
+    with open(path, "rb") as f:
+        f.seek(max(0, size - MARKER_WINDOW))
+        tail = f.read()
+    if MMDB_MARKER not in tail:
+        raise ValueError("MaxMind metadata marker not found")
+
+
+def fsync_dir(d):
+    try:
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def download(kind, ym, ua, dest_dir):
+    url = URL_TEMPLATE.format(kind=kind, ym=ym)
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    try:
+        resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    fd, tmp = tempfile.mkstemp(prefix=f".dbip-{kind}-lite.", suffix=".mmdb", dir=dest_dir)
+    try:
+        with resp, os.fdopen(fd, "wb") as out, gzip.GzipFile(fileobj=resp) as gz:
+            shutil.copyfileobj(gz, out, 1 << 20)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, 0o644)
+        check_mmdb(tmp)
+        return tmp
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def update(kind, today, ua, dest_dir, state, force):
+    final = os.path.join(dest_dir, f"dbip-{kind}-lite.mmdb")
+    for ym in months(today):
+        if not force and state.get(kind) == ym and os.path.exists(final):
+            log(f"{kind}: {ym} already installed")
+            return False
+        tmp = download(kind, ym, ua, dest_dir)
+        if tmp is None:
+            log(f"{kind}: {ym} not published yet (404)")
+            continue
+        os.replace(tmp, final)
+        fsync_dir(dest_dir)
+        state[kind] = ym
+        log(f"{kind}: installed {ym} -> {final}")
+        return True
+    raise RuntimeError("no database for the current or previous month")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="ferret-geo",
+        description="Download DB-IP Lite City and ASN mmdb databases for the nginx "
+                    "ferret module.",
+        epilog=f"Data attribution: {ATTRIBUTION}.")
+    ap.add_argument("--dir", default=DEFAULT_DIR, help=f"target directory (default {DEFAULT_DIR})")
+    ap.add_argument("--contact", default=os.environ.get("FERRET_CONTACT", DEFAULT_UA),
+                    help="HTTP User-Agent (env FERRET_CONTACT)")
+    ap.add_argument("--only", choices=KINDS, help="update only one database")
+    ap.add_argument("--force", action="store_true", help="download even if this month is installed")
+    ap.add_argument("--reload", action="store_true", help="run 'nginx -s reload' if anything changed")
+    ap.add_argument("--changed-marker", metavar="PATH",
+                    help="touch PATH if anything changed (for a privileged ExecStartPost)")
+    a = ap.parse_args(argv)
+
+    os.makedirs(a.dir, exist_ok=True)
+    state_path = os.path.join(a.dir, ".dbip-state.json")
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    changed = False
+    failed = 0
+    for kind in KINDS:
+        if a.only and kind != a.only:
+            continue
+        try:
+            changed |= update(kind, today, a.contact, a.dir, state, a.force)
+        except Exception as e:
+            failed += 1
+            log(f"{kind}: FAILED ({type(e).__name__}: {e}); keeping previous database")
+    tmp = state_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, state_path)
+    if changed:
+        if a.changed_marker:
+            with open(a.changed_marker, "w") as f:
+                f.write("changed\n")
+        if a.reload:
+            r = subprocess.run(["nginx", "-s", "reload"])
+            if r.returncode != 0:
+                log(f"nginx -s reload failed with exit code {r.returncode}")
+                return 2
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
