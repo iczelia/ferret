@@ -638,7 +638,11 @@ static const char * fer_close_class(fer_conn_t * ctx) {
   if (ctx->hello_seen && !ctx->handshaked) return "tls_failed";
   if (!ctx->nreq) return timedout ? "timeout_no_request" : "no_request";
   switch (ctx->last_status) { case 400: case 408: case 413: case 414: case 494: case 497: return "http_error"; }
-  return timedout ? "idle_timeout" : c->error ? "error" : "closed";
+  if (timedout) return "idle_timeout";
+  /*  nginx's HTTP/2 code sets c->error on any client EOF, clean or not.  */
+  if (c->error && ctx->h2.is_h2 && (ctx->h2.goaway_seen ? !ctx->h2.goaway_code : ctx->h2.eof == 1))
+    return "closed";
+  return c->error ? "error" : "closed";
 }
 
 static void fer_conn_cleanup(void * data) {
@@ -840,8 +844,10 @@ static void fer_msg_cb(int write_p, int version, int type, const void * buf, sz 
 static ssize_t fer_recv_tls(ngx_connection_t * c, u_char * buf, size_t size) {
   ssize_t n = ngx_ssl_recv(c, buf, size);
   fer_conn_t * ctx;
-  if (n > 0 && c->ssl && (ctx = fer_ssl_conn(c->ssl->connection)) && ctx->c == c
-      && fer_h2_feed(&ctx->h2, buf, (sz) n) < 0) c->recv = ngx_ssl_recv;
+  if (n >= 0 && c->ssl && (ctx = fer_ssl_conn(c->ssl->connection)) && ctx->c == c) {
+    if (!n) fer_h2_eof(&ctx->h2);
+    else if (fer_h2_feed(&ctx->h2, buf, (sz) n) < 0) c->recv = ngx_ssl_recv;
+  }
   return n;
 }
 
@@ -917,8 +923,10 @@ static ngx_int_t fer_install_ssl(ngx_conf_t * cf) {
 static ssize_t fer_recv_plain(ngx_connection_t * c, u_char * buf, size_t size) {
   ssize_t n = ngx_recv(c, buf, size);
   fer_conn_t * ctx;
-  if (n > 0 && (ctx = fer_find_conn(c)) && ctx->c == c && fer_h2_feed(&ctx->h2, buf, (sz) n) < 0)
-    c->recv = ngx_recv;
+  if (n >= 0 && (ctx = fer_find_conn(c)) && ctx->c == c) {
+    if (!n) fer_h2_eof(&ctx->h2);
+    else if (fer_h2_feed(&ctx->h2, buf, (sz) n) < 0) c->recv = ngx_recv;
+  }
   return n;
 }
 

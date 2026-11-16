@@ -471,6 +471,11 @@ int fer_h2_feed(fer_h2_t * h, const u8 * p, sz n) {
   return 0;
 }
 
+/*  The client closed its side; called when recv returns 0.  */
+void fer_h2_eof(fer_h2_t * h) {
+  if (h->is_h2 && !h->eof) h->eof = h->state == FER_H2_HEAD && !h->fhlen ? 1 : 2;
+}
+
 void fer_h2_finish(fer_h2_t * h) {
   if (h->in_block) h2_block_done(h);
   free(h->hb);  h->hb = NULL;

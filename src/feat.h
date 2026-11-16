@@ -62,6 +62,7 @@ typedef struct {
   u8 pb[256];                            /*  Its first bytes, for small frames.  */
   u8 * hb;  sz hblen;                    /*  First header block, malloc'd.  */
   u8 collect, in_block, headers_seen, block_done, settings_seen, wu_seen, hprio_seen, goaway_seen;
+  u8 eof;                                /*  Client closed: 1 between frames, 2 inside one.  */
   char settings[200], prio[256], pseudo[12], hprio[32];
   u32 wu, goaway_code, max_sid;
   u32 frames[FER_H2_NTYPES];
@@ -69,6 +70,7 @@ typedef struct {
 } fer_h2_t;
 
 int fer_h2_feed(fer_h2_t * h, const u8 * p, sz n);
+void fer_h2_eof(fer_h2_t * h);
 void fer_h2_finish(fer_h2_t * h);
 void fer_h2_fp(const fer_h2_t * h, char * out, sz cap);
 
